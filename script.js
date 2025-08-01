@@ -109,7 +109,8 @@
     }
 
     function parseVotesCount(text) {
-        const match = text.match(/\b(\d{1,5})\+?\s*sold\b/i);
+        const cleaned = text.replace(/,/g, '');
+        const match = cleaned.match(/\b(\d{1,5})\+?\s*sold\b/i);
         return match ? parseInt(match[1]) : null;
     }
 
@@ -130,20 +131,24 @@
     }
 
     function findRatingInCard(card) {
+        let ratingSpan = card.querySelector('span[class*="review_Star_"]');
+        if (ratingSpan) return ratingSpan;
+
         const allDivs = [...card.querySelectorAll('div')].reverse(); // deepest first
 
         for (let div of allDivs) {
-            const ratingSpan = [...div.querySelectorAll('span')].find(
-                span => /^[0-5](\.\d)?$/.test(span.textContent.trim())
+            const span = [...div.querySelectorAll('span')].find(
+                s => /^[0-5](\.\d)?$/.test(s.textContent.trim())
             );
-            const stars = div.querySelectorAll('img[width="12"]');
+            const stars = div.querySelectorAll('img[width="12"], img[style*="width: 12px"]');
 
-            if (ratingSpan && stars.length == 5) {
-                return ratingSpan;
+            if (span && stars.length >= 1) {
+                ratingSpan = span;
+                break;
             }
         }
 
-        return null;
+        return ratingSpan || null;
     }
 
     function addRatingError(card) {
@@ -235,7 +240,9 @@
 
     function hideLowRatedAndPromoItems() {
         let hiddenCount = 0;
-        const cards = document.querySelectorAll('.search-item-card-wrapper-gallery');
+        const cards = document.querySelectorAll(
+            '.search-item-card-wrapper-gallery, [class*="-waterfall-pc-container"] .productContainer'
+        );
 
         log(`[Filter] Processing ${cards.length} cards`);
 
