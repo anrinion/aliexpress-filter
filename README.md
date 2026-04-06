@@ -4,9 +4,8 @@ Tampermonkey script to hide low-rated, low-vote and promo junk on AliExpress.
 
 ## 🛠 Installation
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/)
-2. Create new script → paste `script.js`
-3. Open AliExpress
+1. Install from [GreasyFork](https://greasyfork.org/en/scripts/561248-aliexpress-filter).
+2. Open AliExpress
 
 ## 🖼 UI
 
