@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AliExpress Filter
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Hide low-rated, unrated, low-seller-score, low-votes and promo items on AliExpress
 // @match        *://*.aliexpress.com/*
 // @grant        none
@@ -41,6 +41,17 @@
         // Generic promo/badge selectors (be careful with these)
         '[class*="promo"]',
         '[class*="badge"][class*="discount"]'
+    ];
+
+    // Sale-event banners (11.11 etc.) and title chips, hidden via injected CSS rather than inline styles:
+    // they render late / get re-rendered, which the one-shot per-card cleanup misses.
+    // Class names are hashed, so match by stable fragment.
+    const CSS_GARBAGE_SELECTORS = [
+        '[class*="--sale"][class*="Carousel--"]', // red "11.11 Sale · Ends: Nov 18" bar above results
+        '[class*="--titleIcon--"]',               // "Choice", "SuperDeals" etc. chips before the title
+        // Narrow-window list layout:
+        '[class*="pricePointLineOne--"] > img',   // 11.11 / Choice chips (row also hosts AliHelper's badge)
+        '[class*="pricePointLineTwo--"]',         // red "Sale · -15% now", "Early bird deal", "Extra 1% off with coins"
     ];
 
     // Additional cleanup for sale images by URL patterns
@@ -109,9 +120,13 @@
     }
 
     function parseVotesCount(text) {
-        const cleaned = text.replace(/,/g, '');
-        const match = cleaned.match(/\b(\d{1,5})\+?\s*sold\b/i);
-        return match ? parseInt(match[1]) : null;
+        // "29 sold", "1,000+ sold", "3K+ sold", "1.5K+ sold", "2M+ sold"
+        const match = text.match(/\b(\d[\d,.]*)\s*([km])?\+?\s*sold\b/i);
+        if (!match) return null;
+        const [, number, suffix] = match;
+        if (!suffix) return parseInt(number.replace(/[,.]/g, ''));
+        const multiplier = suffix.toLowerCase() === 'k' ? 1000 : 1000000;
+        return Math.round(parseFloat(number.replace(',', '.')) * multiplier);
     }
 
     function extractVotesNearRating(card, ratingSpan) {
@@ -148,7 +163,8 @@
             }
         }
 
-        return ratingSpan || null;
+        // Narrow-window list layout: rating is span.starRating--* (e.g. "4")
+        return ratingSpan || card.querySelector('span[class*="starRating--"]') || null;
     }
 
     function addRatingError(card) {
@@ -238,32 +254,103 @@
         });
     }
 
+    // The "11.11 Sale" strip at the bottom of the product image ("--scarf--") also hosts
+    // AliHelper's seller-trust badge (a.ah-rating-container, height: 100% of the strip),
+    // so only make AliExpress's own strip image invisible; keep the strip's box.
+    const SCARF_CSS = `
+        html.ae-cleanup [class*="--scarf--"] > img {
+            visibility: hidden !important;
+        }`;
+
+    // The "Free shipping / No import charges / ..." service line is a vertical carousel:
+    // a fixed-height box whose slider is moved by transform, with the first item cloned
+    // at the end for a seamless loop. Freeze it: drop the clone and show all items inline,
+    // "A / B / C", wrapping if needed.
+    const STATIC_SERVICES_CSS = `
+        html.ae-cleanup [class*="--services--"] {
+            height: auto !important; overflow: visible !important;
+        }
+        html.ae-cleanup [class*="--sliderAnimation--"] {
+            transform: none !important; transition: none !important; animation: none !important;
+        }
+        html.ae-cleanup [class*="--serviceItem--"] {
+            display: inline !important; height: auto !important; white-space: normal !important;
+        }
+        html.ae-cleanup [class*="--serviceItem--"]:last-child:not(:first-child) {
+            display: none !important;
+        }
+        html.ae-cleanup [class*="--serviceItem--"] + [class*="--serviceItem--"]::before {
+            content: " / "; color: #999;
+        }`;
+
+    function injectCleanupCss() {
+        const style = document.createElement('style');
+        style.textContent = CSS_GARBAGE_SELECTORS.map(sel => `html.ae-cleanup ${sel}`).join(',\n')
+            + ' { display: none !important; }\n' + SCARF_CSS + STATIC_SERVICES_CSS;
+        document.head.appendChild(style);
+    }
+
+    function applyCleanupClass() {
+        document.documentElement.classList.toggle('ae-cleanup', config.cleanupEnabled);
+    }
+
+    // Promo labels ("Combo Blast", "Bundle Deal", ...) are small badge elements whose
+    // whole text is the keyword. Class names are hashed and change (was "kt_*", now
+    // "new--title--*"), so match by text instead. Exact match avoids hiding products
+    // whose title merely mentions a keyword.
+    const PROMO_KEYWORDS_LC = PROMO_KEYWORDS.map(k => k.toLowerCase());
+    function findPromoLabel(card) {
+        for (const el of card.querySelectorAll('span, div')) {
+            const text = el.textContent.trim();
+            if (text.length > 30) continue;
+            if (PROMO_KEYWORDS_LC.includes(text.toLowerCase())) return el;
+        }
+        return null;
+    }
+
+    // True if something other than this script (e.g. an ad blocker hiding sponsored
+    // "Ad" cards) hides the card. This script only ever sets a plain inline
+    // "display: none", so an !important one, or a stylesheet rule, is someone else's.
+    // Side effect: clears our own inline display so the card starts visible.
+    function isHiddenByOthers(card) {
+        if (card.style.getPropertyPriority('display') === 'important') {
+            return card.style.display === 'none'; // leave their style untouched
+        }
+        card.style.display = '';
+        return getComputedStyle(card).display === 'none';
+    }
+
     function hideLowRatedAndPromoItems() {
         let hiddenCount = 0;
+        let hiddenByOthersCount = 0; // hidden by others, would be shown by us
         const cards = document.querySelectorAll(
-            '.search-item-card-wrapper-gallery, [class*="-waterfall-pc-container"] .productContainer'
+            '.search-item-card-wrapper-gallery, [class*="-waterfall-pc-container"] .productContainer, '
+            + '[class*="listLayout--"] > [class*="listItem--"]' // narrow-window one-column list
         );
 
         log(`[Filter] Processing ${cards.length} cards`);
+        applyCleanupClass();
 
         cards.forEach((card, index) => {
-            card.style.display = '';
+            const hiddenByOthers = isHiddenByOthers(card);
+            const hide = () => {
+                if (!hiddenByOthers) card.style.display = 'none';
+                hiddenCount++;
+            };
 
             if (!config.filterEnabled) {
+                if (hiddenByOthers) hiddenByOthersCount++;
                 // Even if filter is disabled, still clean the cards if cleanup is enabled
                 cleanCard(card);
                 return;
             }
 
             // Check for promo items
-            const promoElements = card.querySelectorAll('span[class*="kt_"], div[class*="kt_"]');
-            for (const element of promoElements) {
-                if (PROMO_KEYWORDS.some(keyword => element.textContent.toLowerCase().includes(keyword.toLowerCase()))) {
-                    card.style.display = 'none';
-                    hiddenCount++;
-                    log(`[Filter] Hidden promo: ${element.textContent.substring(0, 30)}`);
-                    return;
-                }
+            const promoElement = findPromoLabel(card);
+            if (promoElement) {
+                hide();
+                log(`[Filter] Hidden promo: ${promoElement.textContent.trim().substring(0, 30)}`);
+                return;
             }
 
             // Check rating and votes
@@ -271,8 +358,7 @@
             const rating = ratingSpan ? parseNumber(ratingSpan.textContent) : null;
 
             if (rating === null) {
-                card.style.display = 'none';
-                hiddenCount++;
+                hide();
                 log(`[Filter] Hidden no rating: card ${index}`);
                 return;
             }
@@ -280,15 +366,13 @@
             const votes = extractVotesNearRating(card, ratingSpan);
             // Check minimum votes requirement
             if (votes < config.minVotes) {
-                card.style.display = 'none';
-                hiddenCount++;
+                hide();
                 log(`[Filter] Hidden low votes ${votes} (min: ${config.minVotes}): card ${index}`);
                 return;
             }
 
             if (rating < config.minRating) {
-                card.style.display = 'none';
-                hiddenCount++;
+                hide();
                 log(`[Filter] Hidden low rating ${rating}: card ${index}`);
                 return;
             }
@@ -300,8 +384,7 @@
             const sellerRating = sellerRatingEl ? parseNumber(sellerRatingEl.textContent) : null;
 
             if (sellerRating !== null && sellerRating < MIN_SELLER_SCORE) {
-                card.style.display = 'none';
-                hiddenCount++;
+                hide();
                 log(`[Filter] Hidden bad seller ${sellerRating}%: card ${index}`);
                 return;
             }
@@ -309,12 +392,13 @@
             // Also hide if there's a red "unreliable seller" label
             const badSellerLabel = card.querySelector('.ah-label-red');
             if (badSellerLabel) {
-                card.style.display = 'none';
-                hiddenCount++;
+                hide();
                 log(`[Filter] Hidden unreliable seller: card ${index}`);
                 return;
             }
             */
+
+            if (hiddenByOthers) hiddenByOthersCount++;
 
             // Clean the card (remove promotional elements)
             cleanCard(card);
@@ -323,36 +407,66 @@
             addRatingError(card);
         });
 
-        log(`[Filter] Hidden: ${hiddenCount}/${cards.length} cards`);
-        updateStats(`Hidden: ${hiddenCount}/${cards.length} cards`);
+        const othersText = hiddenByOthersCount ? `\n+${hiddenByOthersCount} ads hidden by ad blocker` : '';
+        log(`[Filter] Hidden: ${hiddenCount}/${cards.length} cards${othersText.replace('\n', ', ')}`);
+        updateStats(`Hidden: ${hiddenCount}/${cards.length} cards${othersText}`); // \n: second line (pre-line)
     }
 
     function updateStats(newText) {
         const stats = document.getElementById('ae-filter-stats');
         if (stats) stats.textContent = newText;
+        const fab = document.getElementById('ae-filter-fab');
+        if (fab) fab.title = `Filter+\n${newText}`;
     }
 
+    // Start collapsed on small windows (mobile, popups); clicking the round button opens
+    // the panel, clicking the "Filter+" title collapses it again.
+    const SMALL_WINDOW_QUERY = '(max-width: 768px), (max-height: 600px)';
+    const FILTER_ICON_SVG = `
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 6h16M7 12h10M10 18h4"/>
+        </svg>`;
+
     function createControlPanel() {
-        const panel = document.createElement('div');
-        Object.assign(panel.style, {
+        const corner = { position: 'fixed', bottom: '20px', right: '20px', zIndex: '9999' };
+        const surface = {
             backdropFilter: 'blur(8px)',
             backgroundColor: 'rgba(255, 255, 255, 0.95)',
-            position: 'fixed',
-            bottom: '20px',
-            right: '20px',
-            zIndex: '9999',
-            padding: '15px',
             border: '1px solid #ccc',
-            borderRadius: '8px',
             boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
-            fontSize: '12px',
             color: '#333',
+        };
+
+        const fab = document.createElement('button');
+        fab.id = 'ae-filter-fab';
+        fab.type = 'button';
+        fab.title = 'Filter+';
+        fab.setAttribute('aria-label', 'Open Filter+');
+        fab.innerHTML = FILTER_ICON_SVG;
+        Object.assign(fab.style, corner, surface, {
+            width: '40px',
+            height: '40px',
+            padding: '0',
+            borderRadius: '50%',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            cursor: 'pointer',
+        });
+
+        const panel = document.createElement('div');
+        panel.id = 'ae-filter-panel';
+        Object.assign(panel.style, corner, surface, {
+            padding: '15px',
+            borderRadius: '8px',
+            fontSize: '12px',
             maxWidth: '220px',
             fontFamily: 'sans-serif'
         });
 
         panel.innerHTML = `
-            <div style="font-weight:bold; margin-bottom: 8px; font-size: 13px; text-align:center; color:#222; cursor: pointer;" id="ae-filter-header">🧹 AE Filter</div>
+            <div style="font-weight:bold; margin-bottom: 8px; font-size: 13px; text-align:center; color:#222; cursor: pointer;" id="ae-filter-header" title="Collapse">Filter+</div>
             <div id="ae-filter-body">
                 <label><input type="checkbox" id="ae-toggle-filter"> Filter</label><br>
                 <label><input type="checkbox" id="ae-toggle-cleanup"> Cleanup</label><br>
@@ -361,9 +475,17 @@
                 <input type="range" min="3.5" max="5" step="0.1" value="${config.minRating}" id="ae-min-rating"><br>
                 <label>Min Votes: <span id="ae-votes-val">${config.minVotes}</span></label><br>
                 <input type="range" min="0" max="500" step="10" value="${config.minVotes}" id="ae-min-votes"><br><br>
-                <div id="ae-filter-stats" style="margin-top:6px; font-size:11px; color:#555; text-align:center;">Hidden: 0</div>
+                <div id="ae-filter-stats" style="margin-top:6px; font-size:11px; color:#555; text-align:center; white-space:pre-line;">Hidden: 0</div>
             </div>`;
 
+        const setCollapsed = collapsed => {
+            fab.style.display = collapsed ? 'flex' : 'none';
+            panel.style.display = collapsed ? 'none' : 'block';
+        };
+        setCollapsed(window.matchMedia(SMALL_WINDOW_QUERY).matches);
+        fab.onclick = () => setCollapsed(false);
+
+        document.body.appendChild(fab);
         document.body.appendChild(panel);
 
         document.getElementById('ae-toggle-filter').checked = config.filterEnabled;
@@ -383,10 +505,7 @@
             saveConfig();
         };
 
-        document.getElementById('ae-filter-header').onclick = () => {
-            const body = document.getElementById('ae-filter-body');
-            body.style.display = body.style.display === 'none' ? 'block' : 'none';
-        };
+        document.getElementById('ae-filter-header').onclick = () => setCollapsed(true);
         document.getElementById('ae-min-rating').oninput = e => {
             config.minRating = parseFloat(e.target.value);
             document.getElementById('ae-rating-val').textContent = config.minRating;
@@ -444,6 +563,8 @@
     monitorUrlChanges();
 
     // Launch
+    injectCleanupCss();
+    applyCleanupClass();
     createControlPanel();
-    log('[AliExpress Filter v2.3] started');
+    log('[AliExpress Filter v2.4] started');
 })();
