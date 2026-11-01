@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         AliExpress Filter
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Hide low-rated, unrated, low-seller-score, low-votes and promo items on AliExpress
 // @match        *://*.aliexpress.com/*
 // @grant        none
 // @license      MIT
+// @homepageURL  https://github.com/anrinion/aliexpress-filter
 // ==/UserScript==
 
 (function () {
@@ -23,9 +24,6 @@
         '.kt_lr', // "Top selling on AliExpress" etc
         '.kt_lq', // Free shipping badges
         '.mr_a1.mr_mt', // Free shipping text
-
-        // Partner/affiliate labels
-        '.ah-ref-label', // "Партнерская ссылка"
 
         // Sale images - specifically target the ones you mentioned
         '.mr_mu', // Sale/promo images before product names
@@ -52,6 +50,22 @@
         // Narrow-window list layout:
         '[class*="pricePointLineOne--"] > img',   // 11.11 / Choice chips (row also hosts AliHelper's badge)
         '[class*="pricePointLineTwo--"]',         // red "Sale · -15% now", "Early bird deal", "Extra 1% off with coins"
+        '[class*="--memoTips"]',                  // "Ads may influence search results ranking. Learn here how..."
+        '.ah-ref-label',                          // AliHelper's "Партнерская ссылка" (injected after our per-card pass)
+    ];
+
+    // Upsell chips that share markup with useful ones ("Great price in last month", "Free shipping"),
+    // so they're matched by text. AliExpress reuses card nodes across pages, so these are re-checked on
+    // every pass and marked with a class (not an inline style) that's dropped when the text changes.
+    const TEXT_GARBAGE_CONTAINERS = '[class*="--priceBottomItem--"], [class*="--serviceItem--"]';
+    const TEXT_GARBAGE_PATTERNS = [
+        // "Extra 2% off with coins"
+        /off with coins/i, /mit Münzen/i, /avec les pièces/i, /con monedas/i, /z monetami/i, /^Jetonlarla ekstra/i,
+        /скидка за монеты/i, /з монетами/i, /مع العملات/,
+        // "Top selling on AliExpress"
+        /^Top selling on AliExpress$/i, /^Auf AliExpress meistverkauft$/i, /^Le plus vendu sur AliExpress$/i,
+        /^Top ventas en AliExpress$/i, /^Bestseller AliExpress$/i, /^AliExpress'te en çok satanlar$/i,
+        /^Хит продаж на AliExpress$/i, /^Лідер продажів на AliExpress$/i, /^الأفضل مبيعاً في AliExpress$/,
     ];
 
     // Additional cleanup for sale images by URL patterns
@@ -73,7 +87,9 @@
 
     const config = loadConfig();
     let lastUrl = location.href;
-    let seenCards = new WeakSet();
+    // card -> product it was cleaned for. AliExpress reuses card nodes when paginating,
+    // so a card is re-cleaned when it starts showing a different product.
+    const cleanedFor = new WeakMap();
 
     function loadConfig() {
         const stored = JSON.parse(localStorage.getItem('aeFilterConfig') || '{}');
@@ -82,7 +98,6 @@
 
     function saveConfig() {
         localStorage.setItem('aeFilterConfig', JSON.stringify(config));
-        seenCards = new WeakSet();
         hideLowRatedAndPromoItems();
     }
 
@@ -92,9 +107,10 @@
         }
     }
 
+    // Rating like "4.8", or "4,8" in languages with a decimal comma
     function parseNumber(text) {
-        const match = /* text.match(/([0-9.]+)/) */ text.match(/^([0-5](?:\.\d)?)$/);
-        return match ? parseFloat(match[1]) : null;
+        const match = text.trim().match(/^([0-5](?:[.,]\d)?)$/);
+        return match ? parseFloat(match[1].replace(',', '.')) : null;
     }
 
     function calculateRatingError(rating, votes) {
@@ -119,27 +135,35 @@
         return Math.round(error * 100) / 100;
     }
 
+    // The sold count in each site language: "29 sold", "1K+ sold", "+3 Tsd. verkauft",
+    // "+ 3 K vendus", "3K+ vendidos", "+3 tys. sprzedano", "+3 bin satıldı", "+3 тыс. продано",
+    // "100 000+ продано", "+3 ألف مباعة"
+    const SOLD_WORDS = /(^|[^\p{L}])(sold|verkauft|vendus?|vendid[oa]s?|sprzedan[oey]?|satıldı|продано|مباعة)([^\p{L}]|$)/iu;
+    // Thousands/millions suffixes after the number: "3K+", "3 Tsd.", "3 tys.", "3 mil"
+    const SOLD_MULTIPLIERS = { k: 1e3, tsd: 1e3, tys: 1e3, 'тыс': 1e3, 'тис': 1e3, 'ألف': 1e3, mil: 1e3, bin: 1e3, b: 1e3, m: 1e6, mio: 1e6, 'млн': 1e6, 'مليون': 1e6 };
+    const SOLD_COUNT = new RegExp(
+        String.raw`(\d[\d.,\s]*?)\s*(?:(${Object.keys(SOLD_MULTIPLIERS).sort((a, b) => b.length - a.length).join('|')})(?!\p{L}))?\.?\s*\+?\s*\p{L}`,
+        'iu');
+
     function parseVotesCount(text) {
-        // "29 sold", "1,000+ sold", "3K+ sold", "1.5K+ sold", "2M+ sold"
-        const match = text.match(/\b(\d[\d,.]*)\s*([km])?\+?\s*sold\b/i);
+        if (!SOLD_WORDS.test(text)) return null;
+        const match = text.match(SOLD_COUNT);
         if (!match) return null;
         const [, number, suffix] = match;
-        if (!suffix) return parseInt(number.replace(/[,.]/g, ''));
-        const multiplier = suffix.toLowerCase() === 'k' ? 1000 : 1000000;
-        return Math.round(parseFloat(number.replace(',', '.')) * multiplier);
+        if (!suffix) return parseInt(number.replace(/[.,\s]/g, '')); // "1,000+ sold" -> 1000
+        const value = parseFloat(number.replace(/\s/g, '').replace(',', '.')); // "1,5 Tsd." -> 1.5
+        return Math.round(value * SOLD_MULTIPLIERS[suffix.toLowerCase()]);
     }
 
     function extractVotesNearRating(card, ratingSpan) {
         const context = ratingSpan.closest('div')?.parentElement;
         if (!context) return 0;
 
-        const elements = context.querySelectorAll('*');
-        for (const el of elements) {
-            const txt = el.textContent.trim();
-            const votes = parseVotesCount(txt);
-            if (votes) {
-                return votes;
-            }
+        // Leaf elements only: a container's text would glue the rating onto the count ("4.929 sold")
+        for (const el of context.querySelectorAll('*')) {
+            if (el.children.length) continue;
+            const votes = parseVotesCount(el.textContent.trim());
+            if (votes) return votes;
         }
 
         return 0;
@@ -153,7 +177,7 @@
 
         for (let div of allDivs) {
             const span = [...div.querySelectorAll('span')].find(
-                s => /^[0-5](\.\d)?$/.test(s.textContent.trim())
+                s => parseNumber(s.textContent) !== null
             );
             const stars = div.querySelectorAll('img[width="12"], img[style*="width: 12px"]');
 
@@ -167,90 +191,89 @@
         return ratingSpan || card.querySelector('span[class*="starRating--"]') || null;
     }
 
-    function addRatingError(card) {
+    // Shows "±0.03" after the rating. Re-evaluated on every pass: AliExpress reuses card nodes
+    // when paginating, so a span added for the previous product must be updated or removed.
+    function updateRatingError(card) {
         const ratingSpan = findRatingInCard(card);
-        if (!ratingSpan) return;
-        if (ratingSpan.nextSibling && ratingSpan.nextSibling.classList?.contains('ae-rating-error')) return;
+        const rating = ratingSpan ? parseNumber(ratingSpan.textContent) : null;
+        const votes = rating ? extractVotesNearRating(card, ratingSpan) : 0;
+        const error = votes > 0 ? calculateRatingError(rating, votes) : null;
 
-        const rating = parseNumber(ratingSpan.textContent);
-        if (!rating) return;
+        const next = ratingSpan?.nextSibling;
+        let errorSpan = next?.classList?.contains('ae-rating-error') ? next : null;
+        card.querySelectorAll('.ae-rating-error').forEach(s => { if (s !== errorSpan) s.remove(); });
 
-        const votes = extractVotesNearRating(card, ratingSpan);
-        if (votes > 0) {
-            const error = calculateRatingError(rating, votes);
-            if (error !== null) {
-                const errorSpan = document.createElement('span');
-                errorSpan.className = 'ae-rating-error';
-                errorSpan.style.fontSize = '1em';
-                errorSpan.style.color = '#666';
-                errorSpan.style.marginLeft = '2px';
-                errorSpan.textContent = `±${error}`;
-                ratingSpan.parentNode.insertBefore(errorSpan, ratingSpan.nextSibling);
-            }
+        if (error === null) {
+            errorSpan?.remove();
+            return;
         }
+        if (!errorSpan) {
+            errorSpan = document.createElement('span');
+            errorSpan.className = 'ae-rating-error';
+            errorSpan.style.fontSize = '1em';
+            errorSpan.style.color = '#666';
+            errorSpan.style.marginLeft = '2px';
+            ratingSpan.parentNode.insertBefore(errorSpan, ratingSpan.nextSibling);
+        }
+        const text = `±${error}`;
+        if (errorSpan.textContent !== text) errorSpan.textContent = text; // no-op writes would retrigger the observer
     }
 
+    function markTextGarbage(card) {
+        card.querySelectorAll(TEXT_GARBAGE_CONTAINERS).forEach(el => {
+            const text = el.textContent.trim();
+            const garbage = TEXT_GARBAGE_PATTERNS.some(p => p.test(text));
+            if (el.classList.contains('ae-garbage') !== garbage) el.classList.toggle('ae-garbage', garbage);
+        });
+    }
 
+    function productKey(card) {
+        return card.querySelector('a[href]')?.getAttribute('href') || card.textContent.slice(0, 200);
+    }
+
+    // Legacy per-card cleanup (selectors from older AliExpress markup). Elements are marked with
+    // .ae-hidden, which the injected CSS hides only while Cleanup is on.
     function cleanCard(card) {
-        if (seenCards.has(card)) return;
-        seenCards.add(card);
+        const key = productKey(card);
+        if (cleanedFor.get(card) === key) return;
+        cleanedFor.set(card, key);
 
-        if (!config.cleanupEnabled) return;
-
-        let cardCleanedCount = 0;
+        // Reused card now showing another product: undo what we hid for the previous one
+        card.querySelectorAll('.ae-hidden').forEach(el => el.classList.remove('ae-hidden'));
+        const hide = (el, why) => {
+            el.classList.add('ae-hidden');
+            log(`[Clean] Hidden ${why}: "${el.textContent.trim().substring(0, 30)}"`);
+        };
 
         // Remove elements by selector
         GARBAGE_SELECTORS.forEach(sel => {
-            const elements = card.querySelectorAll(sel);
-            elements.forEach(el => {
+            card.querySelectorAll(sel).forEach(el => {
                 // Don't hide if it contains important info
                 const text = el.textContent.trim();
-                const isImportant = /^\d+\.\d+$/.test(text) || // rating like "4.7"
-                                  /\d+\+?\s*sold/i.test(text) || // sold count
+                const isImportant = parseNumber(text) !== null || // rating like "4.7"
+                                  parseVotesCount(text) !== null || // sold count
                                   /^[\d,]+\.?\d*[€$¥£₽]/.test(text); // main price
-
-                if (!isImportant) {
-                    el.style.display = 'none';
-                    cardCleanedCount++;
-                    log(`[Clean] Hidden by selector "${sel}": "${text.substring(0, 30)}"`);
-                }
+                if (!isImportant) hide(el, `by selector "${sel}"`);
             });
         });
 
         // Specifically target sale images by URL pattern
-        const allImages = card.querySelectorAll('img');
-        allImages.forEach(img => {
+        card.querySelectorAll('img').forEach(img => {
             const src = img.src || '';
-            const shouldHide = SALE_IMAGE_PATTERNS.some(pattern => pattern.test(src));
-
-            if (shouldHide) {
-                // Hide the image and potentially its parent if it's just a container
-                img.style.display = 'none';
-                cardCleanedCount++;
-                log(`[Clean] Hidden sale image: ${src.substring(src.lastIndexOf('/') + 1)}`);
-
-                // If the parent only contains this image and no important text, hide parent too
-                const parent = img.parentElement;
-                if (parent && parent.children.length === 1 && parent.textContent.trim().length < 5) {
-                    parent.style.display = 'none';
-                    log(`[Clean] Hidden parent container of sale image`);
-                }
+            if (!SALE_IMAGE_PATTERNS.some(pattern => pattern.test(src))) return;
+            hide(img, `sale image ${src.substring(src.lastIndexOf('/') + 1)}`);
+            // If the parent only contains this image and no important text, hide parent too
+            const parent = img.parentElement;
+            if (parent && parent.children.length === 1 && parent.textContent.trim().length < 5) {
+                hide(parent, 'parent container of sale image');
             }
         });
 
         // Hide elements with line-through style (crossed prices)
-        const allElements = card.querySelectorAll('*');
-        allElements.forEach(el => {
-            const style = window.getComputedStyle(el);
-            if (style.textDecoration.includes('line-through')) {
-                const text = el.textContent.trim();
-                // Only hide if it looks like a price or promotional text
-                if (/[\d,]+[€$¥£₽]|%|off|sale/i.test(text)) {
-                    el.style.display = 'none';
-                    cardCleanedCount++;
-                    log(`[Clean] Hidden crossed price: "${text}"`);
-                }
-            }
+        card.querySelectorAll('*').forEach(el => {
+            if (!getComputedStyle(el).textDecoration.includes('line-through')) return;
+            // Only hide if it looks like a price or promotional text
+            if (/[\d,]+[€$¥£₽]|%|off|sale/i.test(el.textContent.trim())) hide(el, 'crossed price');
         });
     }
 
@@ -279,14 +302,33 @@
         html.ae-cleanup [class*="--serviceItem--"]:last-child:not(:first-child) {
             display: none !important;
         }
-        html.ae-cleanup [class*="--serviceItem--"] + [class*="--serviceItem--"]::before {
+        html.ae-cleanup [class*="--serviceItem--"]:not(.ae-garbage) ~ [class*="--serviceItem--"]::before {
             content: " / "; color: #999;
+        }`;
+
+    // Doubled class: beats the "display: inline !important" service-item rule above.
+    const MARKED_CSS = `
+        html.ae-cleanup .ae-garbage.ae-garbage, html.ae-cleanup .ae-hidden.ae-hidden {
+            display: none !important;
+        }`;
+
+    // Panel's "?" link to the homepage
+    const PANEL_CSS = `
+        #ae-filter-about {
+            position: absolute; top: 7px; right: 7px; box-sizing: border-box; padding: 0; appearance: none;
+            width: 18px; height: 18px; border-radius: 50%; border: 1px solid #bbb;
+            font: bold 12px/16px sans-serif; text-align: center; text-decoration: none;
+            color: #888; background: transparent; cursor: pointer;
+            transition: color .15s, background-color .15s, border-color .15s;
+        }
+        #ae-filter-about:hover, #ae-filter-about:focus-visible {
+            color: #fff; background-color: #555; border-color: #555; outline: none;
         }`;
 
     function injectCleanupCss() {
         const style = document.createElement('style');
         style.textContent = CSS_GARBAGE_SELECTORS.map(sel => `html.ae-cleanup ${sel}`).join(',\n')
-            + ' { display: none !important; }\n' + SCARF_CSS + STATIC_SERVICES_CSS;
+            + ' { display: none !important; }\n' + SCARF_CSS + STATIC_SERVICES_CSS + MARKED_CSS + PANEL_CSS;
         document.head.appendChild(style);
     }
 
@@ -299,7 +341,12 @@
     // "new--title--*"), so match by text instead. Exact match avoids hiding products
     // whose title merely mentions a keyword.
     const PROMO_KEYWORDS_LC = PROMO_KEYWORDS.map(k => k.toLowerCase());
+    // The "Combo deal ›" link next to the price is a --rainbow-- block in every site language
+    // (e.g. Russian "Комбо-предложение"), so it's matched by class before falling back to text.
+    const PROMO_SELECTOR = '[class*="--price--"] > [class*="--rainbow--"]';
     function findPromoLabel(card) {
+        const promo = card.querySelector(PROMO_SELECTOR);
+        if (promo) return promo;
         for (const el of card.querySelectorAll('span, div')) {
             const text = el.textContent.trim();
             if (text.length > 30) continue;
@@ -337,6 +384,10 @@
                 if (!hiddenByOthers) card.style.display = 'none';
                 hiddenCount++;
             };
+
+            markTextGarbage(card);
+            // Statistical error next to the rating; on hidden cards too, so none is left stale
+            updateRatingError(card);
 
             if (!config.filterEnabled) {
                 if (hiddenByOthers) hiddenByOthersCount++;
@@ -402,9 +453,6 @@
 
             // Clean the card (remove promotional elements)
             cleanCard(card);
-
-            // Add statistical error to rating display
-            addRatingError(card);
         });
 
         const othersText = hiddenByOthersCount ? `\n+${hiddenByOthersCount} ads hidden by ad blocker` : '';
@@ -422,6 +470,7 @@
     // Start collapsed on small windows (mobile, popups); clicking the round button opens
     // the panel, clicking the "Filter+" title collapses it again.
     const SMALL_WINDOW_QUERY = '(max-width: 768px), (max-height: 600px)';
+    const HOMEPAGE_URL = 'https://github.com/anrinion/aliexpress-filter';
     const FILTER_ICON_SVG = `
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
@@ -466,6 +515,8 @@
         });
 
         panel.innerHTML = `
+            <button type="button" id="ae-filter-about"
+               title="Filtering is done by an installed userscript, not by AliExpress. Click to open the userscript's homepage.">?</button>
             <div style="font-weight:bold; margin-bottom: 8px; font-size: 13px; text-align:center; color:#222; cursor: pointer;" id="ae-filter-header" title="Collapse">Filter+</div>
             <div id="ae-filter-body">
                 <label><input type="checkbox" id="ae-toggle-filter"> Filter</label><br>
@@ -506,6 +557,8 @@
         };
 
         document.getElementById('ae-filter-header').onclick = () => setCollapsed(true);
+        // A button, not a link: AliExpress's click tracking appends "?spm=..." to every <a href> on the page
+        document.getElementById('ae-filter-about').onclick = () => window.open(HOMEPAGE_URL, '_blank', 'noopener');
         document.getElementById('ae-min-rating').oninput = e => {
             config.minRating = parseFloat(e.target.value);
             document.getElementById('ae-rating-val').textContent = config.minRating;
@@ -566,5 +619,5 @@
     injectCleanupCss();
     applyCleanupClass();
     createControlPanel();
-    log('[AliExpress Filter v2.4] started');
+    log('[AliExpress Filter v2.5] started');
 })();
